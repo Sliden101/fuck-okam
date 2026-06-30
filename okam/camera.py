@@ -104,10 +104,11 @@ class OKAMCamera:
         Returns:
             Dictionary ready for JSON serialization
         """
+        # Use fresh timestamps from joebiden2.pcapng
         base = {
             'event': event,
             'AccessKey': self.access_key,
-            'timestamp': '1782759886' if 'register' not in event else '1782759887',
+            'timestamp': '1782815529' if event == 'register' else '1782815528',
         }
         
         if self.did:
@@ -196,6 +197,60 @@ class OKAMCamera:
         log.warning('Failed to get relay assignment')
         return None
     
+    def _register_session(self) -> bool:
+        """Register our session with the relay infrastructure.
+        Must be called before connecting to the relay.
+        
+        Returns:
+            True if registered on at least one server
+        """
+        registered = False
+        
+        # Register on 119.23.227.151:32320 (relay hub)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(('119.23.227.151', 32320))
+            
+            # Use fresh register signature (from joebiden2.pcapng)
+            reg_msg = {
+                'event': 'register',
+                'AccessKey': self.access_key,
+                'timestamp': '1782815529',
+                'sign': '2300',
+                'signature': 'k9j2npfFIC+GJBamytCKn+YjtVk=',
+            }
+            resp = self._send_signaling(sock, reg_msg)
+            if resp and resp.get('event') == 'register':
+                log.info('Registered on relay hub 119.23.227.151:32320')
+                registered = True
+            sock.close()
+        except Exception as e:
+            log.debug(f'Register on 119.23.227.151 failed: {e}')
+        
+        # Register on 198.11.174.54:12320 (registration server)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect(('198.11.174.54', 12320))
+            
+            reg_msg = {
+                'event': 'register',
+                'AccessKey': self.access_key,
+                'timestamp': '1782815529',
+                'sign': '2300',
+                'signature': 'k9j2npfFIC+GJBamytCKn+YjtVk=',
+            }
+            resp = self._send_signaling(sock, reg_msg)
+            if resp and resp.get('event') == 'register':
+                log.info('Registered on 198.11.174.54:12320')
+                registered = True
+            sock.close()
+        except Exception as e:
+            log.debug(f'Register on 198.11.174.54 failed: {e}')
+        
+        return registered
+    
     def get_relay_candidates(self) -> list:
         """Get all relay IP:port candidates from signaling + discovery + known list.
         
@@ -216,23 +271,21 @@ class OKAMCamera:
         # 2. From PPPP discovery servers (port 32100)
         discovery_ips = self._get_discovery_relays()
         for ip in discovery_ips:
-            for port in [32100, 32108, 3993, 6582, 20000, 32320]:
+            for port in [32100, 32108, 3993, 6582, 20000, 32320, 12320]:
                 if (ip, port) not in candidates:
                     candidates.append((ip, port))
         
-        # 3. Known relay IPs from pcap captures
+        # 3. Known relay IPs from pcap captures - try these FIRST
         KNOWN_RELAYS = [
-            ('119.15.90.42', 3993),
-            ('119.15.90.42', 6582),
-            ('119.23.227.151', 32320),
-            ('119.23.227.151', 32100),
-            ('66.90.98.42', 20000),
-            ('172.104.207.129', 51000),
-            ('172.232.250.228', 51000),
+            ('119.15.90.42', 3993),      # Fresh pcap video relay
+            ('119.15.90.42', 6582),      # Old pcap video relay
+            ('119.15.90.42', 32100),     # Discovery port
+            ('119.23.227.151', 32320),   # Signaling relay
+            ('119.23.227.151', 32100),   # Discovery port
         ]
         for ip, port in KNOWN_RELAYS:
             if (ip, port) not in candidates:
-                candidates.append((ip, port))
+                candidates.insert(0, (ip, port))  # Prepend - try first
         
         return candidates
     
@@ -291,11 +344,16 @@ class OKAMCamera:
     
     def connect(self) -> bool:
         """Connect to the camera through the P2P relay.
-        Tries signaling, discovery, and known relay IPs.
+        Registers our session, then tries all relay candidates.
         
         Returns:
             True if connected successfully
         """
+        # Step 0: Register our session with relay infrastructure
+        log.info('Registering session...')
+        self._register_session()
+        
+        # Step 1: Get relay candidates
         candidates = self.get_relay_candidates()
         log.info(f'Trying {len(candidates)} relay candidates...')
         
