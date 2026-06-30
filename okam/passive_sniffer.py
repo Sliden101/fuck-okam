@@ -30,7 +30,13 @@ import logging
 import queue
 import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from io import BytesIO
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTPServer that handles each request in a separate thread."""
+    daemon_threads = True
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.pppp import create_psk_hash, pppp_decrypt, SHUFFLE_TABLE
@@ -498,7 +504,7 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
 def start_http(sniffer, host='0.0.0.0', port=8080):
     SnifferHandler.sniffer = sniffer
-    server = HTTPServer((host, port), SnifferHandler)
+    server = ThreadingHTTPServer((host, port), SnifferHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     log.info(f'HTTP server at http://localhost:{port}')
