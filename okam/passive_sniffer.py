@@ -242,8 +242,9 @@ class PassiveSniffer:
                 log.info(f'DETECTED relay: {self.relay_ip}:{self.relay_port}')
                 log.info(f'Receiving PPPP traffic...')
 
-            # Only process packets from the detected relay
-            if src_ip == self.relay_ip or dst_ip == self.relay_ip:
+            # Only process packets from the detected relay (IP + port)
+            if (src_ip == self.relay_ip and src_port == self.relay_port) or \
+               (dst_ip == self.relay_ip and dst_port == self.relay_port):
                 self._process_pppp_packet(dec)
 
         log.info('Starting scapy sniff... (requires Npcap)')
@@ -322,7 +323,8 @@ class PassiveSniffer:
                     self.relay_port = src_port
                 log.info(f'DETECTED relay: {self.relay_ip}:{self.relay_port}')
 
-            if src_ip == self.relay_ip or dst_ip == self.relay_ip:
+            if (src_ip == self.relay_ip and src_port == self.relay_port) or \
+               (dst_ip == self.relay_ip and dst_port == self.relay_port):
                 self._process_pppp_packet(dec)
 
         sock.close()
@@ -463,7 +465,7 @@ class SnifferHandler(BaseHTTPRequestHandler):
         ext.reset_ready()
 
         # Set up queue-based frame delivery for this client
-        frame_queue = queue.Queue(maxsize=60)
+        frame_queue = queue.Queue(maxsize=5)
 
         def on_frame(f):
             try:
