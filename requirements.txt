@@ -1,0 +1,3 @@
+# OKAM Camera Proxy - dependencies (minimal)
+# Core: no external deps (stdlib only)
+# Optional: ffmpeg binary for video transcoding

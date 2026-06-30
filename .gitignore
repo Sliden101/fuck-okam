@@ -1,0 +1,25 @@
+# Large files
+*.pcapng
+*.pcap
+*.apk
+*.h264
+*.jpg
+*.png
+
+# Open camera repo (reference only)
+open_camera/
+
+# Scratch/test files
+crack_signature.py
+try_connect.py	
+okam_frame.jpg
+okam_frame_first.jpg
+okam_snapshot.jpg
+okam_stream.h264
+
+# Python
+__pycache__/
+*.pyc
+
+# Docker
+.env

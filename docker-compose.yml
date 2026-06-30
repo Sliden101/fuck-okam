@@ -1,0 +1,12 @@
+services:
+  okam-proxy:
+    build: .
+    ports:
+      - "8080:8080"
+      - "8554:8554"
+    environment:
+      - OKAM_DID=VE3326855YITZ
+      - OKAM_USER=admin
+      - OKAM_PWD=888888
+      - OKAM_HTTP_PORT=8080
+    restart: unless-stopped
