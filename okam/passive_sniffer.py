@@ -27,6 +27,8 @@ import time
 import struct
 import threading
 import logging
+import queue
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 
@@ -429,36 +431,52 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
         ext = self.sniffer.extractor
 
-        # Wait until we have SPS+PPS+IDR (VLC can't decode without keyframe)
+        # Wait until ready
         waited = 0
         while self.sniffer and self.sniffer.running and not ext.ready:
             time.sleep(0.5)
             waited += 1
-            if waited > 60:  # 30 second timeout
+            if waited > 60:
                 return
 
-        # Send SPS+PPS header once at the start
-        header = ext.get_header()
+        # Send SPS+PPS header
         try:
-            self.wfile.write(header)
-            self.wfile.flush()
+            header = ext.get_header()
+            if header:
+                self.wfile.write(header)
+                self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
             return
 
-        # Stream raw frames after the header
-        last_frame_id = None
-        while self.sniffer and self.sniffer.running:
-            frame = ext.latest_frame
-            frame_id = id(frame) if frame else None
+        # Stream frames. Use a queue to avoid missing frames.
+        import queue
+        frame_queue = queue.Queue(maxsize=30)
 
-            if frame and frame_id != last_frame_id:
+        def on_frame(f):
+            try:
+                frame_queue.put_nowait(f)
+            except queue.Full:
                 try:
+                    frame_queue.get_nowait()
+                    frame_queue.put_nowait(f)
+                except queue.Empty:
+                    pass
+
+        old_cb = ext.frame_callback
+        ext.frame_callback = on_frame
+
+        try:
+            while self.sniffer and self.sniffer.running:
+                try:
+                    frame = frame_queue.get(timeout=1.0)
                     self.wfile.write(frame)
                     self.wfile.flush()
-                    last_frame_id = frame_id
+                except queue.Empty:
+                    continue
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     break
-            time.sleep(0.05)
+        finally:
+            ext.frame_callback = old_cb
 
     def _serve_status(self):
         s = self.sniffer
