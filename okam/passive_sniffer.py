@@ -57,47 +57,59 @@ class H264Extractor:
         self._lock = threading.Lock()
         self._sps = None
         self._pps = None
+        self._has_idr = False
 
-    def _extract_sps_pps(self, data: bytes):
-        """Extract SPS and PPS NAL units from H.264 data."""
+    def _find_nal_units(self, data: bytes) -> list:
+        """Find all NAL units in H.264 data. Returns list of (offset, nal_type, nal_unit)."""
+        units = []
         pos = 0
         while pos < len(data) - 4:
             if data[pos:pos+4] == b'\x00\x00\x00\x01':
                 nal_type = data[pos+4] & 0x1F
-                # Find next NAL start
                 end = pos + 4
                 while end < len(data) - 4:
                     if data[end:end+4] == b'\x00\x00\x00\x01' or data[end:end+3] == b'\x00\x00\x01':
                         break
                     end += 1
-                nal_unit = data[pos:end]
-                if nal_type == 7:  # SPS
-                    self._sps = nal_unit
-                elif nal_type == 8:  # PPS
-                    self._pps = nal_unit
+                units.append((pos, nal_type, data[pos:end]))
                 pos = end
             else:
                 pos += 1
+        return units
+
+    def _extract_sps_pps(self, data: bytes):
+        """Extract SPS and PPS NAL units from H.264 data."""
+        for _, nal_type, nal_unit in self._find_nal_units(data):
+            if nal_type == 7:
+                self._sps = nal_unit
+            elif nal_type == 8:
+                self._pps = nal_unit
+
+    def _has_idr_frame(self, data: bytes) -> bool:
+        """Check if data contains an IDR (keyframe) NAL unit."""
+        for _, nal_type, _ in self._find_nal_units(data):
+            if nal_type == 5:  # IDR slice
+                return True
+        return False
 
     def feed(self, data: bytes):
         """Feed raw video data from DRW channel 1."""
-        # Check for video frame marker
         if data[:4] == VIDEO_MARKER:
             self._boundaries.append(len(self._buffer))
-            video_data = data[32:]  # Skip 32-byte PPPP video header
+            video_data = data[32:]
         else:
             video_data = data
 
         self._buffer.extend(video_data)
 
-        # Extract complete frames
         while len(self._boundaries) >= 2:
             start = self._boundaries[0]
             end = self._boundaries[1]
             frame = bytes(self._buffer[start:end])
 
-            # Try to extract SPS/PPS from this frame
             self._extract_sps_pps(frame)
+            if self._has_idr_frame(frame):
+                self._has_idr = True
 
             with self._lock:
                 self._latest_frame = frame
@@ -106,7 +118,6 @@ class H264Extractor:
             if self.frame_callback:
                 self.frame_callback(frame)
 
-            # Remove processed data
             self._buffer = self._buffer[end:]
             self._boundaries = [b - end for b in self._boundaries[1:]]
 
@@ -119,24 +130,19 @@ class H264Extractor:
     def frame_count(self) -> int:
         return self._frame_count
 
-    def get_playable_frame(self) -> bytes:
-        """Return the latest frame with SPS+PPS prepended (VLC-playable)."""
-        with self._lock:
-            frame = self._latest_frame
-        if frame is None:
-            return None
+    @property
+    def ready(self) -> bool:
+        """True when we have SPS+PPS and at least one IDR frame (VLC can play)."""
+        return self._sps is not None and self._pps is not None and self._has_idr
 
-        # Build header with SPS + PPS
-        header = bytearray()
+    def get_header(self) -> bytes:
+        """Return SPS+PPS header bytes (send once at stream start)."""
+        h = bytearray()
         if self._sps:
-            header.extend(self._sps)
+            h.extend(self._sps)
         if self._pps:
-            header.extend(self._pps)
-
-        if not header:
-            return frame  # No SPS/PPS yet, return raw
-
-        return bytes(header) + frame
+            h.extend(self._pps)
+        return bytes(h)
 
 
 class PassiveSniffer:
@@ -399,15 +405,16 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
     def _serve_html(self):
         s = self.sniffer
+        ext = s.extractor
         relay = f'{s.relay_ip}:{s.relay_port}' if s.relay_ip else 'detecting...'
-        status_class = 'active' if s.packet_count > 0 else 'waiting'
+        ready = 'active' if ext.ready else 'waiting'
 
         html = HTML.format(
             relay=relay,
             packets=s.packet_count,
             video=s.video_packet_count,
-            frames=s.extractor.frame_count,
-            status_class=status_class,
+            frames=ext.frame_count,
+            status_class=ready,
         )
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
@@ -420,23 +427,35 @@ class SnifferHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
 
-        # Wait until we have at least one frame before streaming
+        ext = self.sniffer.extractor
+
+        # Wait until we have SPS+PPS+IDR (VLC can't decode without keyframe)
         waited = 0
-        while self.sniffer and self.sniffer.running and self.sniffer.extractor.frame_count == 0:
+        while self.sniffer and self.sniffer.running and not ext.ready:
             time.sleep(0.5)
             waited += 1
-            if waited > 20:  # 10 second timeout
-                self.wfile.write(b'')
+            if waited > 60:  # 30 second timeout
                 return
 
-        last_frame = None
+        # Send SPS+PPS header once at the start
+        header = ext.get_header()
+        try:
+            self.wfile.write(header)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+            return
+
+        # Stream raw frames after the header
+        last_frame_id = None
         while self.sniffer and self.sniffer.running:
-            frame = self.sniffer.extractor.get_playable_frame()
-            if frame and frame != last_frame:
+            frame = ext.latest_frame
+            frame_id = id(frame) if frame else None
+
+            if frame and frame_id != last_frame_id:
                 try:
                     self.wfile.write(frame)
                     self.wfile.flush()
-                    last_frame = frame
+                    last_frame_id = frame_id
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     break
             time.sleep(0.05)
