@@ -405,15 +405,33 @@ class SnifferHandler(BaseHTTPRequestHandler):
     sniffer = None
 
     def do_GET(self):
-        if self.path == '/':
-            self._serve_html()
-        elif self.path == '/stream.h264':
-            self._serve_h264()
-        elif self.path == '/status':
-            self._serve_status()
-        else:
-            self.send_response(404)
-            self.end_headers()
+        try:
+            if self.path == '/':
+                self._serve_html()
+            elif self.path == '/stream.h264':
+                self._serve_h264()
+            elif self.path == '/status':
+                self._serve_status()
+            elif self.path == '/test':
+                self._serve_test()
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            log.error(f'HTTP error on {self.path}: {e}')
+            import traceback
+            traceback.print_exc()
+            try:
+                self.send_response(500)
+                self.end_headers()
+            except:
+                pass
+
+    def _serve_test(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'HTTP server works!')
 
     def _serve_html(self):
         s = self.sniffer
@@ -516,6 +534,7 @@ class SnifferHandler(BaseHTTPRequestHandler):
 def start_http(sniffer, host='0.0.0.0', port=8080):
     SnifferHandler.sniffer = sniffer
     server = ThreadingHTTPServer((host, port), SnifferHandler)
+    server.allow_reuse_address = True
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     log.info(f'HTTP server at http://localhost:{port}')
