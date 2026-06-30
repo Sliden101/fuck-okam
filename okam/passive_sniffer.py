@@ -143,6 +143,10 @@ class H264Extractor:
         """True when we have SPS+PPS and at least one IDR frame (VLC can play)."""
         return self._sps is not None and self._pps is not None and self._has_idr
 
+    def reset_ready(self):
+        """Reset IDR flag so next VLC client waits for a fresh keyframe."""
+        self._has_idr = False
+
     def get_header(self) -> bytes:
         """Return SPS+PPS header bytes (send once at stream start)."""
         h = bytearray()
@@ -437,26 +441,11 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
         ext = self.sniffer.extractor
 
-        # Wait until ready
-        waited = 0
-        while self.sniffer and self.sniffer.running and not ext.ready:
-            time.sleep(0.5)
-            waited += 1
-            if waited > 60:
-                return
+        # Reset IDR flag — we need a FRESH keyframe for THIS client
+        ext.reset_ready()
 
-        # Send SPS+PPS header
-        try:
-            header = ext.get_header()
-            if header:
-                self.wfile.write(header)
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-            return
-
-        # Stream frames. Use a queue to avoid missing frames.
-        import queue
-        frame_queue = queue.Queue(maxsize=30)
+        # Set up queue-based frame delivery for this client
+        frame_queue = queue.Queue(maxsize=60)
 
         def on_frame(f):
             try:
@@ -472,6 +461,28 @@ class SnifferHandler(BaseHTTPRequestHandler):
         ext.frame_callback = on_frame
 
         try:
+            # Wait for SPS+PPS+FRESH IDR
+            waited = 0
+            while self.sniffer and self.sniffer.running and not ext.ready:
+                # Drain any frames that arrived before IDR
+                try:
+                    frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    pass
+                waited += 1
+                if waited > 120:  # 60 second timeout
+                    return
+
+            # Send SPS+PPS header
+            header = ext.get_header()
+            if header:
+                try:
+                    self.wfile.write(header)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    return
+
+            # Stream frames until client disconnects
             while self.sniffer and self.sniffer.running:
                 try:
                     frame = frame_queue.get(timeout=1.0)
