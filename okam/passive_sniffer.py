@@ -27,8 +27,6 @@ import time
 import struct
 import threading
 import logging
-import queue
-import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from io import BytesIO
@@ -461,27 +459,19 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
         ext = self.sniffer.extractor
 
-        # Set up queue-based frame delivery for this client
-        # ponytail: 15 frames = ~600ms buffer at 25fps
-        frame_queue = queue.Queue(maxsize=15)
+        # ponytail: latest-frame-only, zero queue latency
+        latest = [None]
+        frame_ready = threading.Event()
 
         def on_frame(f):
-            try:
-                frame_queue.put_nowait(f)
-            except queue.Full:
-                try:
-                    frame_queue.get_nowait()
-                    frame_queue.put_nowait(f)
-                except queue.Empty:
-                    pass
+            latest[0] = f
+            frame_ready.set()
 
         old_cb = ext.frame_callback
         ext.frame_callback = on_frame
 
         try:
-            # Drain IDR-wait queue, send SPS+PPS header immediately
-            while frame_queue.qsize():
-                frame_queue.get_nowait()
+            # Send SPS+PPS header immediately
             header = ext.get_header()
             if header:
                 try:
@@ -490,19 +480,18 @@ class SnifferHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     return
 
-            # Stream frames until client disconnects
-            # ponytail: raw H.264, VLC handles NAL boundaries
+            # Stream latest frame only — 0ms buffer latency
             while self.sniffer and self.sniffer.running:
-                try:
-                    # ponytail: 50ms max freeze when queue empties
-                    frame = frame_queue.get(timeout=0.05)
-                    if frame:
-                        self.wfile.write(frame)
+                frame_ready.wait(timeout=0.5)
+                f = latest[0]
+                latest[0] = None
+                frame_ready.clear()
+                if f:
+                    try:
+                        self.wfile.write(f)
                         self.wfile.flush()
-                except queue.Empty:
-                    continue
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                    break
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        break
         finally:
             ext.frame_callback = old_cb
 
