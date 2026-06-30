@@ -55,6 +55,29 @@ class H264Extractor:
         self._frame_count = 0
         self._latest_frame = None
         self._lock = threading.Lock()
+        self._sps = None
+        self._pps = None
+
+    def _extract_sps_pps(self, data: bytes):
+        """Extract SPS and PPS NAL units from H.264 data."""
+        pos = 0
+        while pos < len(data) - 4:
+            if data[pos:pos+4] == b'\x00\x00\x00\x01':
+                nal_type = data[pos+4] & 0x1F
+                # Find next NAL start
+                end = pos + 4
+                while end < len(data) - 4:
+                    if data[end:end+4] == b'\x00\x00\x00\x01' or data[end:end+3] == b'\x00\x00\x01':
+                        break
+                    end += 1
+                nal_unit = data[pos:end]
+                if nal_type == 7:  # SPS
+                    self._sps = nal_unit
+                elif nal_type == 8:  # PPS
+                    self._pps = nal_unit
+                pos = end
+            else:
+                pos += 1
 
     def feed(self, data: bytes):
         """Feed raw video data from DRW channel 1."""
@@ -72,6 +95,9 @@ class H264Extractor:
             start = self._boundaries[0]
             end = self._boundaries[1]
             frame = bytes(self._buffer[start:end])
+
+            # Try to extract SPS/PPS from this frame
+            self._extract_sps_pps(frame)
 
             with self._lock:
                 self._latest_frame = frame
@@ -92,6 +118,25 @@ class H264Extractor:
     @property
     def frame_count(self) -> int:
         return self._frame_count
+
+    def get_playable_frame(self) -> bytes:
+        """Return the latest frame with SPS+PPS prepended (VLC-playable)."""
+        with self._lock:
+            frame = self._latest_frame
+        if frame is None:
+            return None
+
+        # Build header with SPS + PPS
+        header = bytearray()
+        if self._sps:
+            header.extend(self._sps)
+        if self._pps:
+            header.extend(self._pps)
+
+        if not header:
+            return frame  # No SPS/PPS yet, return raw
+
+        return bytes(header) + frame
 
 
 class PassiveSniffer:
@@ -375,18 +420,26 @@ class SnifferHandler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control', 'no-cache')
         self.end_headers()
 
+        # Wait until we have at least one frame before streaming
+        waited = 0
+        while self.sniffer and self.sniffer.running and self.sniffer.extractor.frame_count == 0:
+            time.sleep(0.5)
+            waited += 1
+            if waited > 20:  # 10 second timeout
+                self.wfile.write(b'')
+                return
+
         last_frame = None
         while self.sniffer and self.sniffer.running:
-            frame = self.sniffer.extractor.latest_frame
+            frame = self.sniffer.extractor.get_playable_frame()
             if frame and frame != last_frame:
                 try:
                     self.wfile.write(frame)
                     self.wfile.flush()
                     last_frame = frame
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     break
             time.sleep(0.05)
-        self.wfile.write(b'')
 
     def _serve_status(self):
         s = self.sniffer
