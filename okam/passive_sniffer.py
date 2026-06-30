@@ -461,9 +461,6 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
         ext = self.sniffer.extractor
 
-        # Reset IDR flag — we need a FRESH keyframe for THIS client
-        ext.reset_ready()
-
         # Set up queue-based frame delivery for this client
         # ponytail: 15 frames = ~600ms buffer at 25fps
         frame_queue = queue.Queue(maxsize=15)
@@ -482,19 +479,9 @@ class SnifferHandler(BaseHTTPRequestHandler):
         ext.frame_callback = on_frame
 
         try:
-            # Wait for SPS+PPS+FRESH IDR
-            waited = 0
-            while self.sniffer and self.sniffer.running and not ext.ready:
-                # Drain any frames that arrived before IDR
-                try:
-                    frame_queue.get(timeout=0.5)
-                except queue.Empty:
-                    pass
-                waited += 1
-                if waited > 120:  # 60 second timeout
-                    return
-
-            # Send SPS+PPS header
+            # Drain IDR-wait queue, send SPS+PPS header immediately
+            while frame_queue.qsize():
+                frame_queue.get_nowait()
             header = ext.get_header()
             if header:
                 try:
@@ -504,12 +491,14 @@ class SnifferHandler(BaseHTTPRequestHandler):
                     return
 
             # Stream frames until client disconnects
+            # ponytail: raw H.264, VLC handles NAL boundaries
             while self.sniffer and self.sniffer.running:
                 try:
                     # ponytail: 50ms max freeze when queue empties
                     frame = frame_queue.get(timeout=0.05)
-                    self.wfile.write(frame)
-                    self.wfile.flush()
+                    if frame:
+                        self.wfile.write(frame)
+                        self.wfile.flush()
                 except queue.Empty:
                     continue
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
