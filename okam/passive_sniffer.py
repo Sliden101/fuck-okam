@@ -465,7 +465,8 @@ class SnifferHandler(BaseHTTPRequestHandler):
         ext.reset_ready()
 
         # Set up queue-based frame delivery for this client
-        frame_queue = queue.Queue(maxsize=5)
+        # ponytail: 15 frames = ~600ms buffer at 25fps
+        frame_queue = queue.Queue(maxsize=15)
 
         def on_frame(f):
             try:
@@ -505,7 +506,8 @@ class SnifferHandler(BaseHTTPRequestHandler):
             # Stream frames until client disconnects
             while self.sniffer and self.sniffer.running:
                 try:
-                    frame = frame_queue.get(timeout=1.0)
+                    # ponytail: 50ms max freeze when queue empties
+                    frame = frame_queue.get(timeout=0.05)
                     self.wfile.write(frame)
                     self.wfile.flush()
                 except queue.Empty:
