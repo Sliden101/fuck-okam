@@ -481,23 +481,12 @@ class SnifferHandler(BaseHTTPRequestHandler):
         ext.frame_callback = on_frame
 
         try:
-            # Wait up to 5s for SPS+PPS from live stream
-            header = b''
-            for _ in range(50):
-                header = ext.get_header()
-                if header:
-                    break
-                time.sleep(0.1)
-            # Fallback: known-good SPS+PPS from pcap (VLC plays it fine)
-            if not header:
-                header = FALLBACK_H264_HEADER
-
-            if header:
-                try:
-                    self.wfile.write(header)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                    return
+            # Write fallback header immediately so VLC detects H.264 on first probe
+            try:
+                self.wfile.write(FALLBACK_H264_HEADER)
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                return
 
             # Stream frames to VLC
             while self.sniffer and self.sniffer.running:
