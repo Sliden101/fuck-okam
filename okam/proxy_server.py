@@ -65,86 +65,117 @@ class MJPEGHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode())
     
     def _serve_mjpeg(self):
-        """Serve MJPEG stream by converting H.264 frames to JPEG."""
-        self.send_response(200)
-        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-        self.send_header('Cache-Control', 'no-cache')
-        self.send_header('Connection', 'close')
-        self.end_headers()
+        """Serve MJPEG stream by converting H.264 frames to JPEG via ffmpeg.
+        Falls back to raw H.264 if ffmpeg is not installed."""
+        if not self.camera or not self.camera.is_streaming:
+            # Camera not streaming - serve a static placeholder
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.end_headers()
+            # Send a blank frame so the browser shows something
+            self.wfile.write(b'--FRAME\r\nContent-Type: text/plain\r\n\r\nWaiting for camera...\r\n')
+            self.wfile.flush()
+            while self.camera and not self.camera.is_streaming:
+                time.sleep(2)
+            return
         
-        # Use ffmpeg to convert H.264 to MJPEG
-        # We write H.264 frames to ffmpeg stdin, read JPEG from stdout
-        proc = subprocess.Popen(
-            ['ffmpeg', '-f', 'h264', '-i', 'pipe:0',
-             '-f', 'mjpeg', '-q:v', '5', '-an', 'pipe:1'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-        
-        last_frame_time = time.time()
-        
+        # Try ffmpeg for MJPEG conversion
         try:
-            while self.camera and self.camera.is_streaming:
-                frame = self.camera.snapshot(timeout=5.0)
-                if frame:
-                    try:
-                        proc.stdin.write(frame)
-                        proc.stdin.flush()
-                        last_frame_time = time.time()
-                    except BrokenPipeError:
-                        break
-                elif time.time() - last_frame_time > 30.0:
-                    break  # Timeout
-                
-                # Read JPEG from ffmpeg
-                # ffmpeg outputs individual JPEGs
-                jpeg_data = bytearray()
-                while True:
-                    try:
-                        # Read JPEG header (starts with FF D8)
-                        proc.stdout.flush()
-                        
-                        # Simple JPEG reader from pipe
-                        # Read until we get a complete JPEG
-                        byte = proc.stdout.read(1)
-                        if not byte:
-                            break
-                        
-                        if byte == b'\xff':
-                            byte2 = proc.stdout.read(1)
-                            if byte2 == b'\xd8':  # SOI
-                                jpeg_data = bytearray(b'\xff\xd8')
-                                # Read until EOI
-                                prev = 0
-                                while True:
-                                    b = proc.stdout.read(1)
-                                    if not b:
-                                        break
-                                    jpeg_data.append(b[0])
-                                    if prev == 0xff and b == b'\xd9':  # EOI
-                                        break
-                                    prev = b[0]
-                                
-                                if len(jpeg_data) > 100:
-                                    self.wfile.write(
-                                        b'--FRAME\r\n'
-                                        b'Content-Type: image/jpeg\r\n'
-                                        b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n'
-                                    )
-                                    self.wfile.write(bytes(jpeg_data))
-                                    self.wfile.write(b'\r\n')
-                                    self.wfile.flush()
-                                break
-                    except (BrokenPipeError, OSError):
-                        break
+            proc = subprocess.Popen(
+                ['ffmpeg', '-f', 'h264', '-i', 'pipe:0',
+                 '-f', 'mjpeg', '-q:v', '5', '-an', 'pipe:1'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            has_ffmpeg = True
+        except FileNotFoundError:
+            has_ffmpeg = False
+            log.warning('ffmpeg not found - serving raw H.264 instead of MJPEG')
         
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        finally:
+        self.send_response(200)
+        
+        if has_ffmpeg:
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            
+            last_frame_time = time.time()
+            
             try:
-                proc.stdin.close()
-                proc.stdout.close()
-                proc.terminate()
-            except:
+                while self.camera and self.camera.is_streaming:
+                    frame = self.camera.snapshot(timeout=5.0)
+                    if frame:
+                        try:
+                            proc.stdin.write(frame)
+                            proc.stdin.flush()
+                            last_frame_time = time.time()
+                        except BrokenPipeError:
+                            break
+                    elif time.time() - last_frame_time > 30.0:
+                        break
+                    
+                    jpeg_data = bytearray()
+                    while True:
+                        try:
+                            proc.stdout.flush()
+                            byte = proc.stdout.read(1)
+                            if not byte:
+                                break
+                            
+                            if byte == b'\xff':
+                                byte2 = proc.stdout.read(1)
+                                if byte2 == b'\xd8':
+                                    jpeg_data = bytearray(b'\xff\xd8')
+                                    prev = 0
+                                    while True:
+                                        b = proc.stdout.read(1)
+                                        if not b:
+                                            break
+                                        jpeg_data.append(b[0])
+                                        if prev == 0xff and b == b'\xd9':
+                                            break
+                                        prev = b[0]
+                                    
+                                    if len(jpeg_data) > 100:
+                                        self.wfile.write(
+                                            b'--FRAME\r\n'
+                                            b'Content-Type: image/jpeg\r\n'
+                                            b'Content-Length: ' + str(len(jpeg_data)).encode() + b'\r\n\r\n'
+                                        )
+                                        self.wfile.write(bytes(jpeg_data))
+                                        self.wfile.write(b'\r\n')
+                                        self.wfile.flush()
+                                    break
+                        except (BrokenPipeError, OSError):
+                            break
+            
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                    proc.stdout.close()
+                    proc.terminate()
+                except:
+                    pass
+        else:
+            # No ffmpeg - serve raw H.264
+            self.send_header('Content-Type', 'video/h264')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            
+            last_frame_time = time.time()
+            try:
+                while self.camera and self.camera.is_streaming:
+                    frame = self.camera.snapshot(timeout=5.0)
+                    if frame:
+                        self.wfile.write(frame)
+                        self.wfile.flush()
+                        last_frame_time = time.time()
+                    elif time.time() - last_frame_time > 30.0:
+                        break
+            except (BrokenPipeError, ConnectionResetError):
                 pass
     
     def _serve_snapshot(self):
@@ -155,7 +186,6 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'Camera not streaming')
             return
         
-        # Convert H.264 frame to JPEG using ffmpeg
         frame = self.camera.snapshot(timeout=10.0)
         if not frame:
             self.send_response(503)
@@ -163,13 +193,12 @@ class MJPEGHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'No frame available')
             return
         
-        proc = subprocess.Popen(
-            ['ffmpeg', '-f', 'h264', '-i', 'pipe:0',
-             '-vframes', '1', '-f', 'mjpeg', '-q:v', '5', 'pipe:1'],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        )
-        
         try:
+            proc = subprocess.Popen(
+                ['ffmpeg', '-f', 'h264', '-i', 'pipe:0',
+                 '-vframes', '1', '-f', 'mjpeg', '-q:v', '5', 'pipe:1'],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
             stdout, _ = proc.communicate(input=frame, timeout=5)
             if stdout and len(stdout) > 100:
                 self.send_response(200)
@@ -178,16 +207,18 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(stdout)
                 return
-        except:
+            proc.terminate()
+        except FileNotFoundError:
+            pass  # ffmpeg not installed
+        except Exception:
             pass
-        finally:
-            try:
-                proc.terminate()
-            except:
-                pass
         
-        self.send_response(500)
+        # Fallback: serve raw H.264 frame
+        self.send_response(200)
+        self.send_header('Content-Type', 'video/h264')
+        self.send_header('Content-Length', str(len(frame)))
         self.end_headers()
+        self.wfile.write(frame)
     
     def _serve_status(self):
         """Serve camera status as JSON."""

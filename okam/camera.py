@@ -196,54 +196,153 @@ class OKAMCamera:
         log.warning('Failed to get relay assignment')
         return None
     
+    def get_relay_candidates(self) -> list:
+        """Get all relay IP:port candidates from signaling + discovery + known list.
+        
+        Returns:
+            List of (ip, port) tuples, best candidates first
+        """
+        candidates = []
+        
+        # 1. From signaling server (replay)
+        assignment = self._get_signaling_assignment()
+        if assignment:
+            candidates.append(assignment)
+            # Also try common PPPP ports on the relay host
+            for port in [32100, 32108, 3993, 6582, 12320]:
+                if (assignment[0], port) not in candidates:
+                    candidates.append((assignment[0], port))
+        
+        # 2. From PPPP discovery servers (port 32100)
+        discovery_ips = self._get_discovery_relays()
+        for ip in discovery_ips:
+            for port in [32100, 32108, 3993, 6582, 20000, 32320]:
+                if (ip, port) not in candidates:
+                    candidates.append((ip, port))
+        
+        # 3. Known relay IPs from pcap captures
+        KNOWN_RELAYS = [
+            ('119.15.90.42', 3993),
+            ('119.15.90.42', 6582),
+            ('119.23.227.151', 32320),
+            ('119.23.227.151', 32100),
+            ('66.90.98.42', 20000),
+            ('172.104.207.129', 51000),
+            ('172.232.250.228', 51000),
+        ]
+        for ip, port in KNOWN_RELAYS:
+            if (ip, port) not in candidates:
+                candidates.append((ip, port))
+        
+        return candidates
+    
+    def _get_signaling_assignment(self) -> Optional[tuple]:
+        """Get relay assignment from signaling server."""
+        for host, port in SIGNALING_SERVERS:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(3.0)
+                sock.connect((host, port))
+                
+                msg = self._build_replay_message('getDeviceInfo')
+                resp = self._send_signaling(sock, msg)
+                sock.close()
+                
+                if resp and resp.get('ret') == 0:
+                    ip = resp.get('node_ip')
+                    port = resp.get('node_port')
+                    if ip and port:
+                        return (ip, port)
+            except:
+                continue
+        return None
+    
+    def _get_discovery_relays(self) -> list:
+        """Query PPPP discovery servers and return list of relay IPs."""
+        ips = []
+        hello = build_pppp_packet(0x00, b'', self.key4)  # MSG_HELLO
+        
+        for server in ['150.109.181.22', '161.117.10.18', '47.254.241.56']:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(2.0)
+                sock.bind(('0.0.0.0', 0))
+                sock.sendto(hello, (server, 32100))
+                
+                data, addr = sock.recvfrom(4096)
+                dec = pppp_decrypt(self.key4, data)
+                
+                if len(dec) >= 12:
+                    # Format: f1 01 00 10 0002 XXXX YYYY.YYYY 0000...
+                    # Bytes 6-9 are relay IP (4 bytes, network order)
+                    a, b, c, d = struct.unpack('BBBB', dec[6:10])
+                    ip = f'{a}.{b}.{c}.{d}'
+                    if ip not in ips:
+                        ips.append(ip)
+                        log.debug(f'Discovery {server} -> relay IP {ip}')
+                
+                sock.close()
+            except socket.timeout:
+                pass
+            except Exception as e:
+                log.debug(f'Discovery {server} error: {e}')
+        
+        return ips
+    
     def connect(self) -> bool:
         """Connect to the camera through the P2P relay.
+        Tries signaling, discovery, and known relay IPs.
         
         Returns:
             True if connected successfully
         """
-        # Get relay assignment
-        assignment = self.get_relay_assignment()
-        if not assignment:
-            log.warning('No relay assigned - camera may be offline')
-            return False
+        candidates = self.get_relay_candidates()
+        log.info(f'Trying {len(candidates)} relay candidates...')
         
-        self.relay_ip, self.relay_port = assignment
-        
-        # Connect to relay via UDP
         try:
             self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self._sock.settimeout(5.0)
+            self._sock.settimeout(2.0)
             self._sock.bind(('0.0.0.0', 0))
             
-            # Send KEEPALIVE (handshake) - repeat if needed
+            # Build IDENTIFY with DID (from pcap decryption)
+            did_prefix = b'VSTL\x00\x00\x00\x00'
+            did_serial = struct.pack('>I', 896293)
+            did_check = b'CRMVN\x00\x00\x00'
+            identify_payload = did_prefix + did_serial + did_check
+            while len(identify_payload) < 28:
+                identify_payload += b'\x00'
+            identify = build_pppp_packet(OP_IDENTIFY, identify_payload[:28], self.key4)
             keepalive = build_pppp_packet(OP_KEEPALIVE, b'', self.key4)
             
-            for attempt in range(5):
-                log.debug(f'Handshake attempt {attempt+1}')
-                self._sock.sendto(keepalive, (self.relay_ip, self.relay_port))
+            for ip, port in candidates:
+                log.debug(f'Trying {ip}:{port}...')
                 
-                try:
-                    data, addr = self._sock.recvfrom(4096)
-                    parsed = parse_pppp_packet(data, self.key4)
-                    
-                    if parsed:
-                        log.info(f'Relay responded: {parsed["opcode_name"]} (len={len(data)})')
+                # Send IDENTIFY first (phone does this), then KEEPALIVE
+                self._sock.sendto(identify, (ip, port))
+                time.sleep(0.05)
+                self._sock.sendto(keepalive, (ip, port))
+                
+                for _ in range(3):  # 3 quick retries
+                    try:
+                        data, addr = self._sock.recvfrom(4096)
+                        parsed = parse_pppp_packet(data, self.key4)
                         
-                        # Check for CONTROL response (0x73)
-                        if parsed['opcode'] == OP_CONTROL:
-                            self._connected = True
-                            log.info('Connected to relay')
-                            return True
-                        
-                        # Any response is good
-                        self._connected = True
-                        return True
-                    
-                except socket.timeout:
-                    continue
+                        if parsed:
+                            opname = parsed['opcode_name']
+                            log.info(f'{ip}:{port} -> {opname} ({len(data)}B)')
+                            
+                            if opname in ('CONTROL', 'IDENTIFY', 'KEEPALIVE'):
+                                self.relay_ip = ip
+                                self.relay_port = port
+                                self._connected = True
+                                self._sock.settimeout(5.0)
+                                log.info(f'Connected to relay {ip}:{port}')
+                                return True
+                            
+                    except socket.timeout:
+                        break  # Try next candidate
             
-            log.warning('No response from relay')
+            log.warning('No relay responded')
             return False
             
         except Exception as e:
