@@ -452,14 +452,9 @@ class SnifferHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode())
 
     def _serve_h264(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'video/h264')
-        self.send_header('Cache-Control', 'no-cache')
-        self.end_headers()
-
         ext = self.sniffer.extractor
 
-        # ponytail: latest-frame-only, zero queue latency
+        # Set up frame callback before waiting for SPS/PPS
         latest = [None]
         frame_ready = threading.Event()
 
@@ -471,8 +466,19 @@ class SnifferHandler(BaseHTTPRequestHandler):
         ext.frame_callback = on_frame
 
         try:
-            # Send SPS+PPS header immediately
-            header = ext.get_header()
+            # Wait up to 10s for SPS+PPS so VLC can detect H.264
+            header = b''
+            for _ in range(100):
+                header = ext.get_header()
+                if header:
+                    break
+                time.sleep(0.1)
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'video/h264')
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+
             if header:
                 try:
                     self.wfile.write(header)
