@@ -27,6 +27,7 @@ import time
 import struct
 import threading
 import logging
+import queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from io import BytesIO
@@ -49,6 +50,13 @@ OP_MSG_DRW = 0xD0
 CHANNEL_COMMAND = 0
 CHANNEL_VIDEO = 1
 VIDEO_MARKER = b'\x55\xAA\x15\xA8'
+
+# Known-good SPS+PPS from pcap — VLC detects H.264 when live stream has no header yet
+FALLBACK_H264_HEADER = bytes.fromhex(
+    '0000000167640015ac3b50e043420000030002000003003108'  # SPS (25 bytes)
+    '0000000168ee3ce1004242008484044c521b93c57c9f93f93f'  # PPS (48 bytes)
+    '27c9e6e4c9242c2242909c9e4fafc9fd7e4f'
+)
 
 
 class H264Extractor:
@@ -452,32 +460,37 @@ class SnifferHandler(BaseHTTPRequestHandler):
         self.wfile.write(html.encode())
 
     def _serve_h264(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'video/h264')
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+
         ext = self.sniffer.extractor
 
-        # Set up frame callback before waiting for SPS/PPS
-        latest = [None]
-        frame_ready = threading.Event()
+        # Queue for thread-safe frame handoff to VLC
+        frame_queue = queue.Queue(maxsize=8)
 
         def on_frame(f):
-            latest[0] = f
-            frame_ready.set()
+            try:
+                frame_queue.put_nowait(f)
+            except queue.Full:
+                frame_queue.get_nowait()  # drop oldest
+                frame_queue.put_nowait(f)
 
         old_cb = ext.frame_callback
         ext.frame_callback = on_frame
 
         try:
-            # Wait up to 10s for SPS+PPS so VLC can detect H.264
+            # Wait up to 5s for SPS+PPS from live stream
             header = b''
-            for _ in range(100):
+            for _ in range(50):
                 header = ext.get_header()
                 if header:
                     break
                 time.sleep(0.1)
-
-            self.send_response(200)
-            self.send_header('Content-Type', 'video/h264')
-            self.send_header('Cache-Control', 'no-cache')
-            self.end_headers()
+            # Fallback: known-good SPS+PPS from pcap (VLC plays it fine)
+            if not header:
+                header = FALLBACK_H264_HEADER
 
             if header:
                 try:
@@ -486,18 +499,17 @@ class SnifferHandler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
                     return
 
-            # Stream latest frame only — 0ms buffer latency
+            # Stream frames to VLC
             while self.sniffer and self.sniffer.running:
-                frame_ready.wait(timeout=0.5)
-                f = latest[0]
-                latest[0] = None
-                frame_ready.clear()
-                if f:
-                    try:
-                        self.wfile.write(f)
+                try:
+                    frame = frame_queue.get(timeout=0.1)
+                    if frame:
+                        self.wfile.write(frame)
                         self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                        break
+                except queue.Empty:
+                    continue
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    break
         finally:
             ext.frame_callback = old_cb
 
