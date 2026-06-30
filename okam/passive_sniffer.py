@@ -28,6 +28,7 @@ import struct
 import threading
 import logging
 import queue
+import subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from io import BytesIO
@@ -50,13 +51,6 @@ OP_MSG_DRW = 0xD0
 CHANNEL_COMMAND = 0
 CHANNEL_VIDEO = 1
 VIDEO_MARKER = b'\x55\xAA\x15\xA8'
-
-# Known-good SPS+PPS from pcap — VLC detects H.264 when live stream has no header yet
-FALLBACK_H264_HEADER = bytes.fromhex(
-    '0000000167640015ac3b50e043420000030002000003003108'  # SPS (25 bytes)
-    '0000000168ee3ce1004242008484044c521b93c57c9f93f93f'  # PPS (48 bytes)
-    '27c9e6e4c9242c2242909c9e4fafc9fd7e4f'
-)
 
 
 class H264Extractor:
@@ -467,34 +461,53 @@ class SnifferHandler(BaseHTTPRequestHandler):
 
         ext = self.sniffer.extractor
 
-        # Queue for thread-safe frame handoff to VLC
-        frame_queue = queue.Queue(maxsize=8)
+        # Reset IDR flag — we need a FRESH keyframe for THIS client
+        ext.reset_ready()
+
+        # Set up queue-based frame delivery for this client
+        frame_queue = queue.Queue(maxsize=5)
 
         def on_frame(f):
             try:
                 frame_queue.put_nowait(f)
             except queue.Full:
-                frame_queue.get_nowait()  # drop oldest
-                frame_queue.put_nowait(f)
+                try:
+                    frame_queue.get_nowait()
+                    frame_queue.put_nowait(f)
+                except queue.Empty:
+                    pass
 
         old_cb = ext.frame_callback
         ext.frame_callback = on_frame
 
         try:
-            # Write fallback header immediately so VLC detects H.264 on first probe
-            try:
-                self.wfile.write(FALLBACK_H264_HEADER)
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
-                return
+            # Wait for SPS+PPS+FRESH IDR
+            waited = 0
+            while self.sniffer and self.sniffer.running and not ext.ready:
+                # Drain any frames that arrived before IDR
+                try:
+                    frame_queue.get(timeout=0.5)
+                except queue.Empty:
+                    pass
+                waited += 1
+                if waited > 120:  # 60 second timeout
+                    return
 
-            # Stream frames to VLC
+            # Send SPS+PPS header
+            header = ext.get_header()
+            if header:
+                try:
+                    self.wfile.write(header)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                    return
+
+            # Stream frames until client disconnects
             while self.sniffer and self.sniffer.running:
                 try:
-                    frame = frame_queue.get(timeout=0.1)
-                    if frame:
-                        self.wfile.write(frame)
-                        self.wfile.flush()
+                    frame = frame_queue.get(timeout=1.0)
+                    self.wfile.write(frame)
+                    self.wfile.flush()
                 except queue.Empty:
                     continue
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
